@@ -161,3 +161,5 @@ The paper mentions several future directions that can be layered on top of this 
 ## License
 
 MIT — see [LICENSE.txt](LICENSE.txt)
+
+**AI Assistance Disclaimer**: This codebase was developed with the assistance of Claude Code. While the AI provided code generation, debugging, and structural support, the human developer maintains full responsibility for reviewing, testing, and maintaining all content and functionality.
