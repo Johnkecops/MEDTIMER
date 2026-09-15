@@ -47,12 +47,11 @@ from typing import Optional
 DB_PATH        = Path(__file__).parent / "meditimer.db"
 SLOT_TOLERANCE = 5  # minutes of grace period around each scheduled time
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+# Library code never calls basicConfig() — that's the host application's
+# call. A NullHandler keeps "No handlers found" warnings quiet for callers
+# who don't configure logging at all.
 log = logging.getLogger("meditimer")
+log.addHandler(logging.NullHandler())
 
 
 # ---------------------------------------------------------------------------
@@ -71,12 +70,15 @@ def validate_prescription_inputs(
 
     Checked invariants
     ------------------
+    - At least one drug must be given.
     - All four lists must have the same length.
     - Every drug name must be a non-empty string.
     - Every frequency must be a positive integer (1–24 doses/day).
     - Every duration must be a positive integer (at least 1 day).
     - Every dose must be a positive number.
     """
+    if not drugs:
+        raise ValueError("At least one drug is required.")
     if not (len(drugs) == len(frequencies) == len(durations) == len(doses)):
         raise ValueError(
             f"Input lists must have equal length. Got: "
@@ -122,7 +124,8 @@ def init_database(db_path: str = str(DB_PATH)) -> sqlite3.Connection:
     log.info("Connecting to database: %s", db_path)
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")   # safe for concurrent Streamlit access
+    conn.execute("PRAGMA journal_mode=WAL")     # safe for concurrent Streamlit access
+    conn.execute("PRAGMA foreign_keys=ON")      # enforce the schema's REFERENCES
     _create_schema(conn)
     return conn
 
@@ -332,12 +335,21 @@ def build_schedule_from_prescription(
     Returns
     -------
     int : number of slot rows inserted
+
+    Note
+    ----
+    Each drug's dose timestamps are computed from its OWN frequency
+    (24h / frequency between doses), independent of every other drug in
+    this prescription. An earlier version derived clock times from
+    `prescription_to_slots()`'s shared slot-matrix grid (sized by
+    max(frequency*duration) across drugs) using a single slot_duration
+    based on the highest frequency present — that only produced correct
+    wall-clock times when every drug's frequency*duration divided evenly
+    against the max, which the demo TB regimen (2,2,1 / 4,4,4) satisfied
+    by coincidence. `prescription_to_slots()` itself is unchanged and
+    still used for the paper's slot-matrix visualisation.
     """
     validate_prescription_inputs(drugs, frequencies, durations, doses)
-
-    slot_matrix, max_slots = prescription_to_slots(
-        drugs, frequencies, durations, doses
-    )
 
     drug_ids = []
     for name in drugs:
@@ -348,32 +360,28 @@ def build_schedule_from_prescription(
             cur = conn.execute("INSERT INTO drugs (name) VALUES (?)", (name,))
             drug_ids.append(cur.lastrowid)
 
-    prescription_ids = []
+    rows_inserted = 0
     for drug_id, freq, dur, dose in zip(drug_ids, frequencies, durations, doses):
         cur = conn.execute("""
             INSERT INTO prescriptions
                 (patient_id, drug_id, dose, frequency, duration_days, start_date)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (patient_id, drug_id, dose, freq, dur, start_datetime.date().isoformat()))
-        prescription_ids.append(cur.lastrowid)
+        prescription_id = cur.lastrowid
 
-    max_daily_freq = max(frequencies)
-    slot_duration  = datetime.timedelta(hours=24.0 / max_daily_freq)
-
-    rows_inserted = 0
-    for slot_idx in range(max_slots):
-        slot_time = start_datetime + slot_duration * slot_idx
-        for presc_id, drug_slots in zip(prescription_ids, slot_matrix):
-            if drug_slots[slot_idx] == 1:
-                conn.execute("""
-                    INSERT INTO medication_slots
-                        (patient_id, prescription_id, slot_index, scheduled_time)
-                    VALUES (?, ?, ?, ?)
-                """, (
-                    patient_id, presc_id, slot_idx,
-                    slot_time.isoformat(timespec="minutes"),
-                ))
-                rows_inserted += 1
+        total_doses   = freq * dur
+        dose_interval = datetime.timedelta(hours=24.0 / freq)
+        for slot_idx in range(total_doses):
+            slot_time = start_datetime + dose_interval * slot_idx
+            conn.execute("""
+                INSERT INTO medication_slots
+                    (patient_id, prescription_id, slot_index, scheduled_time)
+                VALUES (?, ?, ?, ?)
+            """, (
+                patient_id, prescription_id, slot_idx,
+                slot_time.isoformat(timespec="minutes"),
+            ))
+            rows_inserted += 1
 
     conn.commit()
     log.info(
@@ -411,7 +419,7 @@ def nfc_connection(rfid: str, expected_code: str) -> bool:
     -------
     bool : True if codes match (slot unlocks), False otherwise
     """
-    if rfid == expected_code:
+    if secrets.compare_digest(rfid, expected_code):
         log.info("NFC match — slot unlocked.")
         return True
     log.warning("NFC mismatch — access denied.")
@@ -461,6 +469,21 @@ def timer_check(
     return delta <= tolerance_minutes * 60
 
 
+def is_overdue(scheduled_time: str) -> bool:
+    """
+    True once wall-clock time has passed the scheduled dose time — the
+    dose can (and should) still be marked taken. `timer_check()` alone
+    goes back to False once its ±tolerance window closes, which used to
+    leave overdue doses stuck with no way to log them (#3/#4 audit).
+    """
+    try:
+        sched = datetime.datetime.fromisoformat(scheduled_time)
+    except ValueError:
+        log.error("is_overdue: cannot parse scheduled_time '%s'", scheduled_time)
+        return False
+    return datetime.datetime.now() > sched
+
+
 # ---------------------------------------------------------------------------
 # Schedule query helpers
 # ---------------------------------------------------------------------------
@@ -470,10 +493,14 @@ def get_next_alarm(
     patient_id: int,
 ) -> Optional[dict]:
     """
-    Returns the next untaken medication slot for the given patient,
-    or None if no future doses are scheduled.
+    Returns the medication slot the patient needs to act on next: the
+    oldest untaken slot, whether it's still upcoming or already overdue.
+    Returns None if every scheduled dose has been taken.
+
+    (Previously filtered to `scheduled_time >= now`, so an overdue slot
+    vanished from view the instant its minute passed and could never be
+    marked taken — see audit #3.)
     """
-    now = datetime.datetime.now().isoformat(timespec="minutes")
     row = conn.execute("""
         SELECT
             ms.id              AS slot_id,
@@ -488,10 +515,9 @@ def get_next_alarm(
         JOIN drugs d         ON p.drug_id = d.id
         WHERE ms.patient_id = ?
           AND ms.taken = 0
-          AND ms.scheduled_time >= ?
         ORDER BY ms.scheduled_time
         LIMIT 1
-    """, (patient_id, now)).fetchone()
+    """, (patient_id,)).fetchone()
     return dict(row) if row else None
 
 
@@ -557,8 +583,29 @@ def get_adherence_report(
 # User authentication
 # ---------------------------------------------------------------------------
 
-def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
+PBKDF2_ITERATIONS = 200_000
+
+
+def hash_password(password: str, salt: Optional[str] = None) -> str:
+    """
+    PBKDF2-HMAC-SHA256 with a random per-user salt, stored as
+    'salt_hex$hash_hex'. Replaces a bare unsalted SHA-256 hash (audit #1)
+    that was crackable via rainbow tables.
+    """
+    if salt is None:
+        salt = secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac(
+        "sha256", password.encode(), bytes.fromhex(salt), PBKDF2_ITERATIONS
+    )
+    return f"{salt}${dk.hex()}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    """Constant-time check of `password` against a stored 'salt$hash' value."""
+    salt, _, _ = stored_hash.partition("$")
+    if not salt or "$" not in stored_hash:
+        return False
+    return secrets.compare_digest(hash_password(password, salt), stored_hash)
 
 
 def create_user(
@@ -586,18 +633,21 @@ def authenticate_user(
 ) -> Optional[dict]:
     """
     Returns the user dict if credentials are valid, otherwise None.
-    Passwords are stored as SHA-256 hashes; plain-text is never persisted.
+    Passwords are stored as salted PBKDF2-HMAC-SHA256 hashes; plain-text
+    is never persisted.
     """
     row = conn.execute("""
-        SELECT id, username, role, full_name, nfc_code
+        SELECT id, username, role, full_name, nfc_code, password_hash
         FROM users
-        WHERE username = ? AND password_hash = ?
-    """, (username, hash_password(password))).fetchone()
-    if row:
+        WHERE username = ?
+    """, (username,)).fetchone()
+    if row and verify_password(password, row["password_hash"]):
         log.info("Login successful: '%s'", username)
-    else:
-        log.warning("Failed login attempt for username: '%s'", username)
-    return dict(row) if row else None
+        user = dict(row)
+        user.pop("password_hash", None)
+        return user
+    log.warning("Failed login attempt for username: '%s'", username)
+    return None
 
 
 # ---------------------------------------------------------------------------

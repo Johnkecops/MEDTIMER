@@ -30,6 +30,7 @@ Limitations:
 """
 
 import datetime
+import sqlite3
 
 import streamlit as st
 import pandas as pd
@@ -46,6 +47,7 @@ from meditimer_core import (
     mark_slot_taken,
     nfc_connection,
     timer_check,
+    is_overdue,
     prescription_to_slots,
 )
 
@@ -195,7 +197,7 @@ def page_login():
                         f"Account created for {new_name}. "
                         "Sign in above, then ask your pharmacist to add your prescription."
                     )
-                except Exception:
+                except sqlite3.IntegrityError:
                     st.error("That username is taken — try a different one.")
 
 
@@ -222,13 +224,16 @@ def page_patient():
         else:
             sched_dt = datetime.datetime.fromisoformat(next_slot["scheduled_time"])
             is_due   = timer_check(next_slot["scheduled_time"])
+            overdue  = is_overdue(next_slot["scheduled_time"])
 
             col1, col2 = st.columns(2)
             with col1:
                 st.metric("Next dose", sched_dt.strftime("%H:%M"))
                 st.caption(sched_dt.strftime("%A, %d %b %Y"))
             with col2:
-                if is_due:
+                if overdue:
+                    st.metric("Status", "⚠️ Overdue")
+                elif is_due:
                     st.metric("Status", "⚠️ Due now")
                 else:
                     st.metric("Time left", countdown_str(next_slot["scheduled_time"]))
@@ -238,7 +243,7 @@ def page_patient():
                 f"**Dose:** {next_slot['dose']} {next_slot['unit']}"
             )
 
-            if is_due:
+            if is_due or overdue:
                 if st.button("I took this dose", use_container_width=True, type="primary"):
                     mark_slot_taken(conn, next_slot["slot_id"])
                     st.success("Done. Dose logged.")
@@ -273,8 +278,11 @@ def page_patient():
                 seen.add(key)
 
                 try:
-                    dt    = datetime.datetime.fromisoformat(row["time"])
-                    label = dt.strftime("%-I:%M %p, %d %b")
+                    dt = datetime.datetime.fromisoformat(row["time"])
+                    # Portable 12-hour format — strftime's "%-I" no-leading-zero
+                    # flag is glibc/Linux-only and breaks on Windows Python.
+                    hour12 = dt.strftime("%I").lstrip("0") or "12"
+                    label  = f"{hour12}:{dt.strftime('%M %p, %d %b')}"
                 except Exception:
                     label = row["time"]
 
