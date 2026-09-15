@@ -3,7 +3,7 @@
 > Python/Streamlit implementation of the MediTimer software described in:
 >
 > Tera, T. C., Triwijaya, R., Natasya, N., Natasya, J., & Parikesit, A. A. (2022).
-> **MEDITIMER: YOUR PERSONAL MEDICAL TIMER.** *RINarxiv.* https://zenodo.org/records/22767064 
+> **MEDITIMER: YOUR PERSONAL MEDICAL TIMER.** *Zenodo Preprint.* https://zenodo.org/records/22767064 
 
 ---
 
